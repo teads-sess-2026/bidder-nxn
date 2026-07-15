@@ -24,6 +24,7 @@ public class BidderMetrics {
     private final Counter losses;
     private final Counter spend;
     private final Timer bidLatency;
+    public final Counter summerschool_bids;
 
     private final String prefix;
 
@@ -46,6 +47,7 @@ public class BidderMetrics {
                 .description("Total clearing price paid").register(registry);
         this.bidLatency = Timer.builder(prefix + "bid.latency")
                 .description("Bid handling latency").register(registry);
+        this.summerschool_bids = Counter.builder(prefix + "summerschool_bids").description("SummerSchool bids").register(registry);
     }
 
     public void recordRequest() { requests.increment(); }

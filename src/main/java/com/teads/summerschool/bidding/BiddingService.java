@@ -102,6 +102,7 @@ public class BiddingService {
         //      can look this bid up without a DB round trip
         //   8. Save the BidRecord with bidRecordRepository.save(record) and return
         //      Optional.of(new BidResponse(...)) or Optional.empty()
+        metrics.summerschool_bids.increment();
         metrics.recordRequest();
         metrics.recordNoBid("not_implemented");
         BidRecord record = buildRecord(request);
