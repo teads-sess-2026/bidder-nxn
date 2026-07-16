@@ -72,6 +72,7 @@ public class BidderStatsCache {
                         List.of(key),
                         List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
                 .next()
+                .map(result -> convertToDouble(result))
                 .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
                 .flatMap(after -> creativeRepository.findById(creativeId)
                         .flatMap(c -> {
@@ -88,6 +89,17 @@ public class BidderStatsCache {
                         }
                     }
                 });
+    }
+
+    /** Convert Redis result (String or Double) to Double */
+    private Double convertToDouble(Object result) {
+        if (result instanceof String) {
+            log.debug("REDIS returned String, converting: {}", result);
+            return Double.parseDouble((String) result);
+        } else if (result instanceof Number) {
+            return ((Number) result).doubleValue();
+        }
+        throw new IllegalStateException("Unexpected Redis result type: " + result.getClass());
     }
 
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */

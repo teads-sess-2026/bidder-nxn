@@ -30,7 +30,7 @@ import java.util.Random;
 public class BiddingService {
 
     private static final Logger log = LoggerFactory.getLogger(BiddingService.class);
-    private static final int MAX_CONCURRENT_BIDS = 40;
+    private static final int MAX_CONCURRENT_BIDS = 80;
 
     private final Random random = new Random();
     private final java.util.concurrent.atomic.AtomicInteger concurrentBids = new java.util.concurrent.atomic.AtomicInteger(0);
@@ -117,7 +117,7 @@ public class BiddingService {
                     }
 
                     return matchingCreatives(request, Flux.fromIterable(withinBudget))
-                            .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> budget > 0))
+                            .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> budget > 10.0))
                             .collectList()
                             .flatMap(eligibleCreatives -> {
                                 if (eligibleCreatives.isEmpty()) {
@@ -158,9 +158,9 @@ public class BiddingService {
         long sampleCount = statsCache.getSampleCount();
         long winCount = statsCache.getWinCount();
 
-        // Cold start phase: bid aggressively to learn market prices
+        // Cold start phase: bid conservatively to stretch budget
         if (sampleCount < properties.getStrategy().getMinSamples()) {
-            return floorPrice * 1.12;
+            return floorPrice * 1.08;
         }
 
         double avgClearingPrice = statsCache.getRollingAverageWinPrice();
@@ -175,15 +175,15 @@ public class BiddingService {
 
         // Adaptive bidding based on win rate:
         // - Winning too much (> 50%): conserve budget, bid lower
-        // - Winning too little (< 20%): bid more aggressively
+        // - Winning too little (< 20%): bid slightly more
         // - Sweet spot (20-50%): bid slightly above market average
         double multiplier;
         if (winRate > 0.50) {
-            multiplier = 0.95;  // Conserve budget
+            multiplier = 0.90;  // Conserve budget more aggressively
         } else if (winRate < 0.20) {
-            multiplier = 1.15;  // Be more aggressive
+            multiplier = 1.05;  // Be slightly more aggressive (was 1.15)
         } else {
-            multiplier = 1.08;  // Competitive sweet spot
+            multiplier = 1.02;  // Conservative sweet spot (was 1.08)
         }
 
         double targetBid = avgClearingPrice * multiplier;

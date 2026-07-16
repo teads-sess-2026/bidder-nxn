@@ -29,7 +29,7 @@ public class CreativeSeeder implements ApplicationRunner {
     private static final int    CREATIVE_COUNT    = 200;
     private static final long   SEED              = 42;
     private static final double MAX_BID_PRICE_MIN = 0.05;
-    private static final double MAX_BID_PRICE_MAX = 0.30;
+    private static final double MAX_BID_PRICE_MAX = 1.00;
 
     private final CreativeRepository repository;
     private final BidderProperties   properties;
