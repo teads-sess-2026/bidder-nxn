@@ -72,7 +72,7 @@ public class AuctionNoticeConsumer {
                 log.debug("KAFKA  Clearing price: {}", clearingPrice);
 
                 log.debug("KAFKA  Recording win in statsCache for creative={}", ourBid.creativeId());
-                statsCache.recordWin(ourBid.creativeId(), clearingPrice).block();
+                statsCache.recordWin(clearingPrice);
                 log.debug("KAFKA  Win recorded in statsCache");
 
                 log.debug("KAFKA  Creating WinNotice record");
