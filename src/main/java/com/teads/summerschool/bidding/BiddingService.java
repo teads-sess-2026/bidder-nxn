@@ -7,15 +7,12 @@ import com.teads.summerschool.config.BidderProperties;
 import com.teads.summerschool.creative.Creative;
 import com.teads.summerschool.creative.CreativeCache;
 import com.teads.summerschool.metrics.BidderMetrics;
-import com.teads.summerschool.record.BidRecord;
-import com.teads.summerschool.record.BidRecordRepository;
 import com.teads.summerschool.record.BidderStatsCache;
 import com.teads.summerschool.record.OwnBidCache;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
@@ -26,16 +23,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class BiddingService {
 
     private static final Logger log = LoggerFactory.getLogger(BiddingService.class);
-    private static final int MAX_CONCURRENT_BIDS = 80;
+    private static final int MAX_CONCURRENT_BIDS = 200;
 
     private final Random random = new Random();
-    private final java.util.concurrent.atomic.AtomicInteger concurrentBids = new java.util.concurrent.atomic.AtomicInteger(0);
+    private final AtomicInteger concurrentBids = new AtomicInteger(0);
 
     // Pacing: track spend over time to distribute evenly
     private final Instant startTime = Instant.now();
@@ -47,7 +45,6 @@ public class BiddingService {
 
     private final BidderProperties properties;
     private final CreativeCache creativeCache;
-    private final BidRecordRepository bidRecordRepository;
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
@@ -58,13 +55,11 @@ public class BiddingService {
 
     public BiddingService(BidderProperties properties,
                           CreativeCache creativeCache,
-                          BidRecordRepository bidRecordRepository,
                           BidderStatsCache statsCache,
                           BidderMetrics metrics,
                           OwnBidCache ownBidCache) {
         this.properties = properties;
         this.creativeCache = creativeCache;
-        this.bidRecordRepository = bidRecordRepository;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
@@ -165,13 +160,14 @@ public class BiddingService {
     private boolean shouldBid() {
         long elapsedSeconds = Duration.between(startTime, Instant.now()).getSeconds() + 1;
         long durationSeconds = properties.getCompetition().getDurationSeconds();
-        if (durationSeconds <= 0) durationSeconds = 1800;
+        if (durationSeconds <= 0) durationSeconds = 600;
 
         double totalBudget = properties.getCreativeBudget() * 200.0; // $25 × 200 = $5000
         double expectedSpend = (double) elapsedSeconds / durationSeconds * totalBudget;
         double actualSpend = totalSpentCents.get() / 100.0;
 
-        return actualSpend < expectedSpend * 1.1;
+        // Allow up to 3x ahead of linear schedule — competition is a race, not a marathon
+        return actualSpend < expectedSpend * 3;
     }
 
     private Map<String, Double> getBudgetSnapshot() {
@@ -201,27 +197,27 @@ public class BiddingService {
         long lossCount = statsCache.getLossCount();
         long totalBids = winCount + lossCount;
 
-        // Cold start: bid just above floor
-        if (totalBids < 10) {
-            return floorPrice * 1.02;
+        // Cold start: bid aggressively to collect data
+        if (totalBids < 20) {
+            return floorPrice * 1.10;
         }
 
         double winRate = (double) winCount / totalBids;
 
         double targetBid;
-        if (winRate > 0.5) {
-            // Winning too much: bid minimum to save budget
-            targetBid = floorPrice * 1.01;
-        } else if (winRate > 0.2) {
-            // Good range: bid slightly above floor
-            targetBid = floorPrice * 1.03;
+        if (winRate > 0.6) {
+            // Winning a lot: save some budget
+            targetBid = floorPrice * 1.05;
+        } else if (winRate > 0.3) {
+            // Healthy range: bid moderately above floor
+            targetBid = floorPrice * 1.10;
         } else {
-            // Losing too much: bid closer to market clearing price
+            // Losing too much: match the market
             double avgLoss = statsCache.getRollingAverageLossPrice();
-            targetBid = avgLoss > 0 ? avgLoss * 0.95 : floorPrice * 1.05;
+            targetBid = avgLoss > 0 ? avgLoss * 1.02 : floorPrice * 1.15;
         }
 
-        return Math.max(targetBid, floorPrice * 1.01);
+        return Math.max(targetBid, floorPrice * 1.05);
     }
 
     /** Total remaining budget across all this bidder's creatives. */
@@ -236,13 +232,6 @@ public class BiddingService {
         return creativeCache.getAll()
                 .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
                 .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
-    }
-
-    private Flux<Creative> matchingCreatives(BidRequest request, Flux<Creative> all) {
-        return all.filter(c -> c.matches(
-                        request.targeting().geo(),
-                        request.targeting().deviceType(),
-                        request.targeting().audienceSegment()));
     }
 
     private CreativeDto toCreativeDto(Creative creative) {
@@ -266,15 +255,4 @@ public class BiddingService {
                 .toList();
     }
 
-    private BidRecord buildRecord(BidRequest request) {
-        BidRecord record = new BidRecord();
-        record.setRequestId(request.requestId());
-        record.setFloorPrice(request.floorPrice());
-        if (request.targeting() != null) {
-            record.setGeo(request.targeting().geo());
-            record.setDeviceType(request.targeting().deviceType());
-            record.setAudienceSegment(request.targeting().audienceSegment());
-        }
-        return record;
-    }
 }
