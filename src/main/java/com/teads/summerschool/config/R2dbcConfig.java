@@ -16,7 +16,7 @@ import org.springframework.context.annotation.Configuration;
  * is static per pooled connection — no per-checkout reset is needed.
  */
 @Configuration
-public class R2dbcConfig {
+public class R2dbcConfig { //reactive connection to the database
 
     @Bean
     public ConnectionFactoryOptionsBuilderCustomizer searchPathCustomizer(BidderProperties bidderProperties) {

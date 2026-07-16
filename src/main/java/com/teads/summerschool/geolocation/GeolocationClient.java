@@ -7,7 +7,7 @@ import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 
-@Service
+//@Service
 public class GeolocationClient {
 
     private final WebClient webClient;

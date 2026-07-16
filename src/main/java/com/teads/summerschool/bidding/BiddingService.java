@@ -30,8 +30,10 @@ import java.util.Random;
 public class BiddingService {
 
     private static final Logger log = LoggerFactory.getLogger(BiddingService.class);
+    private static final int MAX_CONCURRENT_BIDS = 40;
 
     private final Random random = new Random();
+    private final java.util.concurrent.atomic.AtomicInteger concurrentBids = new java.util.concurrent.atomic.AtomicInteger(0);
 
     private final BidderProperties properties;
     private final CreativeCache creativeCache;
@@ -89,35 +91,105 @@ public class BiddingService {
     }
 
     public Mono<Optional<BidResponse>> bid(BidRequest request) {
-        // TODO: implement your bidding strategy
-        // Hints:
-        //   1. Record the request with buildRecord(request)
-        //   2. Find matching creatives with matchingCreatives(request, creativeCache.getAll())
-        //   3. Filter creatives whose maxBidPrice covers this floor: c.isWithinMaxBid(request.floorPrice())
-        //   4. Filter creatives that still have budget: statsCache.getRemainingBudget(c.getId()) > 0
-        //      (returns a Mono<Double> — flatMap/filterWhen into it)
-        //   5. Compute a bid price with computeBidPrice(request)
-        //   6. Record metrics: metrics.recordRequest(), metrics.recordBid(), metrics.recordNoBid(reason)
-        //   7. Call ownBidCache.record(requestId, creativeId, bidPrice) so AuctionNoticeConsumer
-        //      can look this bid up without a DB round trip
-        //   8. Save the BidRecord with bidRecordRepository.save(record) and return
-        //      Optional.of(new BidResponse(...)) or Optional.empty()
+        // Rate limit: reject if too many concurrent bids already processing
+        if (concurrentBids.get() >= MAX_CONCURRENT_BIDS) {
+            metrics.recordNoBid("rate_limited");
+            return Mono.just(Optional.empty());
+        }
+
+        long start = System.nanoTime();
         metrics.summerschool_bids.increment();
         metrics.recordRequest();
-        metrics.recordNoBid("not_implemented");
+
         BidRecord record = buildRecord(request);
-        record.setNoBidReason("not_implemented");
-        long start = System.nanoTime();
-        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-        metrics.recordLatency(0);
-        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+        concurrentBids.incrementAndGet();
+
+        return creativeCache.getAll()
+                .filter(c -> c.isWithinMaxBid(request.floorPrice()))
+                .collectList()
+                .flatMap(withinBudget -> {
+                    if (withinBudget.isEmpty()) {
+                        record.setNoBidReason("floor_exceeds_max_bid");
+                        metrics.recordNoBid("floor_exceeds_max_bid");
+                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                        metrics.recordLatency(record.getLatencyMs());
+                        return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+                    }
+
+                    return matchingCreatives(request, Flux.fromIterable(withinBudget))
+                            .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> budget > 0))
+                            .collectList()
+                            .flatMap(eligibleCreatives -> {
+                                if (eligibleCreatives.isEmpty()) {
+                                    record.setNoBidReason("no_eligible_creatives");
+                                    metrics.recordNoBid("no_eligible_creatives");
+                                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                                    metrics.recordLatency(record.getLatencyMs());
+                                    return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+                                }
+
+                                Creative selectedCreative = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+                                double bidPrice = computeBidPrice(request);
+
+                                record.setCreativeId(selectedCreative.getId());
+                                record.setBidPrice(bidPrice);
+                                record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+
+                                metrics.recordBid();
+                                metrics.recordLatency(record.getLatencyMs());
+
+                                ownBidCache.record(request.requestId(), selectedCreative.getId(), bidPrice);
+
+                                BidResponse response = new BidResponse(
+                                        request.requestId(),
+                                        bidPrice,
+                                        toCreativeDto(selectedCreative)
+                                );
+
+                                return bidRecordRepository.save(record).thenReturn(Optional.of(response));
+                            });
+                })
+                .doFinally(signal -> concurrentBids.decrementAndGet());
     }
 
     private double computeBidPrice(BidRequest request) {
-        // TODO: implement your pricing strategy
-        // The bid must be above request.floorPrice().
-        // Use properties.getStrategy() for tuning parameters.
-        return request.floorPrice() * 1.01;
+        double floorPrice = request.floorPrice();
+
+        long sampleCount = statsCache.getSampleCount();
+        long winCount = statsCache.getWinCount();
+
+        // Cold start phase: bid aggressively to learn market prices
+        if (sampleCount < properties.getStrategy().getMinSamples()) {
+            return floorPrice * 1.12;
+        }
+
+        double avgClearingPrice = statsCache.getRollingAverageWinPrice();
+
+        // No market data yet: bid moderately above floor
+        if (avgClearingPrice <= 0) {
+            return floorPrice * 1.08;
+        }
+
+        // Calculate win rate to adjust strategy
+        double winRate = sampleCount > 0 ? (double) winCount / sampleCount : 0.0;
+
+        // Adaptive bidding based on win rate:
+        // - Winning too much (> 50%): conserve budget, bid lower
+        // - Winning too little (< 20%): bid more aggressively
+        // - Sweet spot (20-50%): bid slightly above market average
+        double multiplier;
+        if (winRate > 0.50) {
+            multiplier = 0.95;  // Conserve budget
+        } else if (winRate < 0.20) {
+            multiplier = 1.15;  // Be more aggressive
+        } else {
+            multiplier = 1.08;  // Competitive sweet spot
+        }
+
+        double targetBid = avgClearingPrice * multiplier;
+
+        // Never bid below floor + 1%
+        return Math.max(targetBid, floorPrice * 1.01);
     }
 
     /** Total remaining budget across all this bidder's creatives. */

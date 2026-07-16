@@ -3,5 +3,5 @@ package com.teads.summerschool.bidding.dto;
 public record Targeting(
         String geo,
         String deviceType,
-        String audienceSegment
+        String audienceSegment //interests of the user
 ) {}

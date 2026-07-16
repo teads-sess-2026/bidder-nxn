@@ -7,8 +7,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
-@RestController
-@RequestMapping("/api/geolocation")
+//@RestController
+//@RequestMapping("/api/geolocation")
 public class GeolocationController {
 
     private final GeolocationClient geolocationClient;
