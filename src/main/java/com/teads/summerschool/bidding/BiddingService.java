@@ -19,12 +19,14 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 public class BiddingService {
@@ -34,6 +36,14 @@ public class BiddingService {
 
     private final Random random = new Random();
     private final java.util.concurrent.atomic.AtomicInteger concurrentBids = new java.util.concurrent.atomic.AtomicInteger(0);
+
+    // Pacing: track spend over time to distribute evenly
+    private final Instant startTime = Instant.now();
+    private final AtomicLong totalSpentCents = new AtomicLong(0);
+
+    // Budget snapshot: refreshed every 1 second instead of per-request Redis calls
+    private volatile Map<String, Double> budgetSnapshot = new LinkedHashMap<>();
+    private volatile long lastBudgetFetch = 0;
 
     private final BidderProperties properties;
     private final CreativeCache creativeCache;
@@ -97,11 +107,16 @@ public class BiddingService {
             return Mono.just(Optional.empty());
         }
 
+        // Pacing: only bid if we're behind or on schedule for spending
+        if (!shouldBid()) {
+            metrics.recordNoBid("rate_limited");
+            return Mono.just(Optional.empty());
+        }
+
         long start = System.nanoTime();
         metrics.summerschool_bids.increment();
         metrics.recordRequest();
 
-        BidRecord record = buildRecord(request);
         concurrentBids.incrementAndGet();
 
         return creativeCache.getAll()
@@ -109,86 +124,103 @@ public class BiddingService {
                 .collectList()
                 .flatMap(withinBudget -> {
                     if (withinBudget.isEmpty()) {
-                        record.setNoBidReason("floor_exceeds_max_bid");
                         metrics.recordNoBid("floor_exceeds_max_bid");
-                        record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-                        metrics.recordLatency(record.getLatencyMs());
-                        return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
+                        return Mono.just(Optional.<BidResponse>empty());
                     }
 
-                    return matchingCreatives(request, Flux.fromIterable(withinBudget))
-                            .filterWhen(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> budget > 10.0))
-                            .collectList()
-                            .flatMap(eligibleCreatives -> {
-                                if (eligibleCreatives.isEmpty()) {
-                                    record.setNoBidReason("no_eligible_creatives");
-                                    metrics.recordNoBid("no_eligible_creatives");
-                                    record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
-                                    metrics.recordLatency(record.getLatencyMs());
-                                    return bidRecordRepository.save(record).thenReturn(Optional.<BidResponse>empty());
-                                }
+                    // Use in-memory budget snapshot instead of Redis calls per creative
+                    Map<String, Double> budgets = getBudgetSnapshot();
+                    List<Creative> eligibleCreatives = withinBudget.stream()
+                            .filter(c -> c.matches(
+                                    request.targeting().geo(),
+                                    request.targeting().deviceType(),
+                                    request.targeting().audienceSegment()))
+                            .filter(c -> budgets.getOrDefault(c.getId(), 25.0) > 5.0)
+                            .toList();
 
-                                Creative selectedCreative = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
-                                double bidPrice = computeBidPrice(request);
+                    if (eligibleCreatives.isEmpty()) {
+                        metrics.recordNoBid("no_eligible_creatives");
+                        return Mono.just(Optional.<BidResponse>empty());
+                    }
 
-                                record.setCreativeId(selectedCreative.getId());
-                                record.setBidPrice(bidPrice);
-                                record.setLatencyMs((int) ((System.nanoTime() - start) / 1_000_000));
+                    Creative selectedCreative = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+                    double bidPrice = computeBidPrice(request);
 
-                                metrics.recordBid();
-                                metrics.recordLatency(record.getLatencyMs());
+                    metrics.recordBid();
+                    metrics.recordLatency((int) ((System.nanoTime() - start) / 1_000_000));
 
-                                ownBidCache.record(request.requestId(), selectedCreative.getId(), bidPrice);
+                    ownBidCache.record(request.requestId(), selectedCreative.getId(), bidPrice);
 
-                                BidResponse response = new BidResponse(
-                                        request.requestId(),
-                                        bidPrice,
-                                        toCreativeDto(selectedCreative)
-                                );
+                    BidResponse response = new BidResponse(
+                            request.requestId(),
+                            bidPrice,
+                            toCreativeDto(selectedCreative)
+                    );
 
-                                return bidRecordRepository.save(record).thenReturn(Optional.of(response));
-                            });
+                    return Mono.just(Optional.of(response));
                 })
                 .doFinally(signal -> concurrentBids.decrementAndGet());
+    }
+
+    private boolean shouldBid() {
+        long elapsedSeconds = Duration.between(startTime, Instant.now()).getSeconds() + 1;
+        long durationSeconds = properties.getCompetition().getDurationSeconds();
+        if (durationSeconds <= 0) durationSeconds = 1800;
+
+        double totalBudget = properties.getCreativeBudget() * 200.0; // $25 × 200 = $5000
+        double expectedSpend = (double) elapsedSeconds / durationSeconds * totalBudget;
+        double actualSpend = totalSpentCents.get() / 100.0;
+
+        return actualSpend < expectedSpend * 1.1;
+    }
+
+    private Map<String, Double> getBudgetSnapshot() {
+        long now = System.currentTimeMillis();
+        if (now - lastBudgetFetch > 1000) {
+            lastBudgetFetch = now;
+            try {
+                Map<String, Double> fresh = getRemainingBudgets().block(Duration.ofMillis(100));
+                if (fresh != null) {
+                    budgetSnapshot = fresh;
+                }
+            } catch (Exception e) {
+                // use stale snapshot on timeout
+            }
+        }
+        return budgetSnapshot;
+    }
+
+    public void recordSpend(double amount) {
+        totalSpentCents.addAndGet((long) (amount * 100));
     }
 
     private double computeBidPrice(BidRequest request) {
         double floorPrice = request.floorPrice();
 
-        long sampleCount = statsCache.getSampleCount();
         long winCount = statsCache.getWinCount();
+        long lossCount = statsCache.getLossCount();
+        long totalBids = winCount + lossCount;
 
-        // Cold start phase: bid conservatively to stretch budget
-        if (sampleCount < properties.getStrategy().getMinSamples()) {
-            return floorPrice * 1.08;
+        // Cold start: bid just above floor
+        if (totalBids < 10) {
+            return floorPrice * 1.02;
         }
 
-        double avgClearingPrice = statsCache.getRollingAverageWinPrice();
+        double winRate = (double) winCount / totalBids;
 
-        // No market data yet: bid moderately above floor
-        if (avgClearingPrice <= 0) {
-            return floorPrice * 1.08;
-        }
-
-        // Calculate win rate to adjust strategy
-        double winRate = sampleCount > 0 ? (double) winCount / sampleCount : 0.0;
-
-        // Adaptive bidding based on win rate:
-        // - Winning too much (> 50%): conserve budget, bid lower
-        // - Winning too little (< 20%): bid slightly more
-        // - Sweet spot (20-50%): bid slightly above market average
-        double multiplier;
-        if (winRate > 0.50) {
-            multiplier = 0.90;  // Conserve budget more aggressively
-        } else if (winRate < 0.20) {
-            multiplier = 1.05;  // Be slightly more aggressive (was 1.15)
+        double targetBid;
+        if (winRate > 0.5) {
+            // Winning too much: bid minimum to save budget
+            targetBid = floorPrice * 1.01;
+        } else if (winRate > 0.2) {
+            // Good range: bid slightly above floor
+            targetBid = floorPrice * 1.03;
         } else {
-            multiplier = 1.02;  // Conservative sweet spot (was 1.08)
+            // Losing too much: bid closer to market clearing price
+            double avgLoss = statsCache.getRollingAverageLossPrice();
+            targetBid = avgLoss > 0 ? avgLoss * 0.95 : floorPrice * 1.05;
         }
 
-        double targetBid = avgClearingPrice * multiplier;
-
-        // Never bid below floor + 1%
         return Math.max(targetBid, floorPrice * 1.01);
     }
 

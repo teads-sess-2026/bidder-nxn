@@ -32,19 +32,21 @@ public class BidderStatsCache {
     // ARGV[2] = clearing price to subtract. Atomic on the Redis server itself, replacing the old
     // synchronized setIfAbsent()-then-increment() pair, which only ever guarded against
     // concurrent callers within this one JVM, not against Redis itself.
-    private static final RedisScript<Double> RECORD_WIN_SCRIPT = RedisScript.of("""
+    private static final RedisScript<String> RECORD_WIN_SCRIPT = RedisScript.of("""
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
             return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
-            """, Double.class);
+            """, String.class);
 
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
     private final CreativeRepository creativeRepository;
 
     private final AtomicLong winCount = new AtomicLong(0);
+    private final AtomicLong lossCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
+    private final Deque<Double> recentLossPrices = new ArrayDeque<>();
 
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
                              CreativeRepository creativeRepository) {
@@ -72,7 +74,7 @@ public class BidderStatsCache {
                         List.of(key),
                         List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
                 .next()
-                .map(result -> convertToDouble(result))
+                .map(result -> Double.parseDouble(result))
                 .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
                 .flatMap(after -> creativeRepository.findById(creativeId)
                         .flatMap(c -> {
@@ -89,17 +91,6 @@ public class BidderStatsCache {
                         }
                     }
                 });
-    }
-
-    /** Convert Redis result (String or Double) to Double */
-    private Double convertToDouble(Object result) {
-        if (result instanceof String) {
-            log.debug("REDIS returned String, converting: {}", result);
-            return Double.parseDouble((String) result);
-        } else if (result instanceof Number) {
-            return ((Number) result).doubleValue();
-        }
-        throw new IllegalStateException("Unexpected Redis result type: " + result.getClass());
     }
 
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */
@@ -131,5 +122,26 @@ public class BidderStatsCache {
 
     public long getSampleCount() {
         return winCount.get();
+    }
+
+    public void recordLoss(double clearingPrice) {
+        lossCount.incrementAndGet();
+        synchronized (recentLossPrices) {
+            recentLossPrices.addLast(clearingPrice);
+            if (recentLossPrices.size() > properties.getStrategy().getWindowSize()) {
+                recentLossPrices.pollFirst();
+            }
+        }
+    }
+
+    public double getRollingAverageLossPrice() {
+        synchronized (recentLossPrices) {
+            if (recentLossPrices.isEmpty()) return 0.0;
+            return recentLossPrices.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+        }
+    }
+
+    public long getLossCount() {
+        return lossCount.get();
     }
 }
