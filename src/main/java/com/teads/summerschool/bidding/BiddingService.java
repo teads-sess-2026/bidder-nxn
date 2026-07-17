@@ -1,5 +1,4 @@
 package com.teads.summerschool.bidding;
-
 import com.teads.summerschool.bidding.dto.BidRequest;
 import com.teads.summerschool.bidding.dto.BidResponse;
 import com.teads.summerschool.bidding.dto.CreativeDto;
@@ -23,8 +22,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 @Service
 public class BiddingService {
@@ -32,8 +35,19 @@ public class BiddingService {
     private static final Logger log = LoggerFactory.getLogger(BiddingService.class);
     private static final int MAX_CONCURRENT_BIDS = 200;
 
-    private final Random random = new Random();
     private final AtomicInteger concurrentBids = new AtomicInteger(0);
+
+    // Pre-indexed creative lookups for fast targeting-based filtering
+    private volatile Map<String, List<Creative>> creativesByGeo = new ConcurrentHashMap<>();
+    private volatile Map<String, List<Creative>> creativesByDevice = new ConcurrentHashMap<>();
+    private volatile Map<String, List<Creative>> creativesBySegment = new ConcurrentHashMap<>();
+    private volatile List<Creative> allCreativesCache = List.of();
+
+    // Cached stats to avoid Redis reads on every bid
+    private volatile long cachedWinCount = 0;
+    private volatile long cachedLossCount = 0;
+    private volatile double cachedAvgLossPrice = 0;
+    private volatile long lastStatsFetch = 0;
 
     // Pacing: track spend over time to distribute evenly
     private final Instant startTime = Instant.now();
@@ -68,11 +82,108 @@ public class BiddingService {
     @PostConstruct
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
-        metrics.registerGauge("concurrent.bids", () -> concurrentBids.get());
-        metrics.registerGauge("budget.snapshot.age", () -> System.currentTimeMillis() - lastBudgetFetch);
-        metrics.registerGauge("pacing.headroom", this::getPacingHeadroom);
-        metrics.registerGauge("win.rate", this::getWinRate);
-        metrics.registerGauge("budget.burn.rate", this::getBurnRate);
+        buildCreativeIndex();
+    }
+
+    /**
+     * Pre-index creatives by targeting dimensions (geo, device, segment) to avoid
+     * filtering all 200 creatives on every bid. Refreshes every 5 seconds to pick up
+     * any creative changes.
+     */
+    private void buildCreativeIndex() {
+        creativeCache.getAll()
+                .collectList()
+                .subscribe(creatives -> {
+                    allCreativesCache = creatives;
+
+                    // Index by geo
+                    Map<String, List<Creative>> byGeo = new ConcurrentHashMap<>();
+                    for (Creative c : creatives) {
+                        for (String geo : extractTargetingValues(c.getAllowedGeos())) {
+                            byGeo.computeIfAbsent(geo, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                        // If no geo targeting, add to wildcard bucket
+                        if (c.getAllowedGeos() == null || c.getAllowedGeos().isBlank()) {
+                            byGeo.computeIfAbsent("*", k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                    }
+                    creativesByGeo = byGeo;
+
+                    // Index by device
+                    Map<String, List<Creative>> byDevice = new ConcurrentHashMap<>();
+                    for (Creative c : creatives) {
+                        for (String device : extractTargetingValues(c.getAllowedDevices())) {
+                            byDevice.computeIfAbsent(device, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                        if (c.getAllowedDevices() == null || c.getAllowedDevices().isBlank()) {
+                            byDevice.computeIfAbsent("*", k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                    }
+                    creativesByDevice = byDevice;
+
+                    // Index by segment
+                    Map<String, List<Creative>> bySegment = new ConcurrentHashMap<>();
+                    for (Creative c : creatives) {
+                        for (String segment : extractTargetingValues(c.getAudienceSegments())) {
+                            bySegment.computeIfAbsent(segment, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                        if (c.getAudienceSegments() == null || c.getAudienceSegments().isBlank()) {
+                            bySegment.computeIfAbsent("*", k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                    }
+                    creativesBySegment = bySegment;
+
+                    log.info("Creative index built: {} creatives, {} geos, {} devices, {} segments",
+                            creatives.size(), byGeo.size(), byDevice.size(), bySegment.size());
+                });
+
+        // Refresh index every 5 seconds to pick up creative changes
+        reactor.core.publisher.Flux.interval(Duration.ofSeconds(5))
+                .flatMap(tick -> creativeCache.getAll().collectList())
+                .subscribe(creatives -> {
+                    allCreativesCache = creatives;
+
+                    Map<String, List<Creative>> byGeo = new ConcurrentHashMap<>();
+                    for (Creative c : creatives) {
+                        for (String geo : extractTargetingValues(c.getAllowedGeos())) {
+                            byGeo.computeIfAbsent(geo, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                        if (c.getAllowedGeos() == null || c.getAllowedGeos().isBlank()) {
+                            byGeo.computeIfAbsent("*", k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                    }
+                    creativesByGeo = byGeo;
+
+                    Map<String, List<Creative>> byDevice = new ConcurrentHashMap<>();
+                    for (Creative c : creatives) {
+                        for (String device : extractTargetingValues(c.getAllowedDevices())) {
+                            byDevice.computeIfAbsent(device, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                        if (c.getAllowedDevices() == null || c.getAllowedDevices().isBlank()) {
+                            byDevice.computeIfAbsent("*", k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                    }
+                    creativesByDevice = byDevice;
+
+                    Map<String, List<Creative>> bySegment = new ConcurrentHashMap<>();
+                    for (Creative c : creatives) {
+                        for (String segment : extractTargetingValues(c.getAudienceSegments())) {
+                            bySegment.computeIfAbsent(segment, k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                        if (c.getAudienceSegments() == null || c.getAudienceSegments().isBlank()) {
+                            bySegment.computeIfAbsent("*", k -> new java.util.concurrent.CopyOnWriteArrayList<>()).add(c);
+                        }
+                    }
+                    creativesBySegment = bySegment;
+                });
+    }
+
+    private Set<String> extractTargetingValues(String csv) {
+        if (csv == null || csv.isBlank()) return Set.of();
+        return Arrays.stream(csv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toSet());
     }
 
     /**
@@ -119,37 +230,41 @@ public class BiddingService {
 
         concurrentBids.incrementAndGet();
 
-        return creativeCache.getAll()
-                .filter(c -> c.isWithinMaxBid(request.floorPrice()))
-                .collectList()
-                .flatMap(withinBudget -> {
-                    if (withinBudget.isEmpty()) {
-                        metrics.recordNoBid("floor_exceeds_max_bid");
-                        return Mono.just(Optional.<BidResponse>empty());
+        return Mono.fromCallable(() -> {
+                    // Use pre-indexed creatives instead of fetching all 200
+                    List<Creative> candidates = getTargetedCreatives(
+                            request.targeting().geo(),
+                            request.targeting().deviceType(),
+                            request.targeting().audienceSegment()
+                    );
+
+                    if (candidates.isEmpty()) {
+                        metrics.recordNoBid("no_targeted_creatives");
+                        return Optional.<BidResponse>empty();
                     }
 
-                    // Use in-memory budget snapshot instead of Redis calls per creative
+                    // Filter by floor price and budget
                     Map<String, Double> budgets = getBudgetSnapshot();
-                    List<Creative> eligibleCreatives = withinBudget.stream()
-                            .filter(c -> c.matches(
-                                    request.targeting().geo(),
-                                    request.targeting().deviceType(),
-                                    request.targeting().audienceSegment()))
+                    List<Creative> eligibleCreatives = candidates.stream()
+                            .filter(c -> c.isWithinMaxBid(request.floorPrice()))
                             .filter(c -> budgets.getOrDefault(c.getId(), 25.0) > 5.0)
                             .toList();
 
                     if (eligibleCreatives.isEmpty()) {
                         metrics.recordNoBid("no_eligible_creatives");
-                        return Mono.just(Optional.<BidResponse>empty());
+                        return Optional.<BidResponse>empty();
                     }
 
-                    Creative selectedCreative = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));  //this can be done such that from all the creatives the one chosen ends up the one with higheest price
+                    // Select creative and compute bid price
+                    Creative selectedCreative = eligibleCreatives.get(
+                            ThreadLocalRandom.current().nextInt(eligibleCreatives.size())
+                    );
                     double bidPrice = computeBidPrice(request);
 
                     metrics.recordBid();
-                    metrics.recordBidPrice(bidPrice);
                     metrics.recordLatency((int) ((System.nanoTime() - start) / 1_000_000));
 
+                    // Record asynchronously (fire-and-forget)
                     ownBidCache.record(request.requestId(), selectedCreative.getId(), bidPrice);
 
                     BidResponse response = new BidResponse(
@@ -158,9 +273,40 @@ public class BiddingService {
                             toCreativeDto(selectedCreative)
                     );
 
-                    return Mono.just(Optional.of(response));
+                    return Optional.of(response);
                 })
                 .doFinally(signal -> concurrentBids.decrementAndGet());
+    }
+
+    /**
+     * Get creatives matching the request's targeting using pre-built indexes.
+     * Returns intersection of geo, device, and segment matches (or wildcards).
+     */
+    private List<Creative> getTargetedCreatives(String geo, String device, String segment) {
+        // Get candidates from geo index (or wildcard if geo not found)
+        List<Creative> geoCandidates = creativesByGeo.getOrDefault(geo,
+                creativesByGeo.getOrDefault("*", List.of()));
+
+        // Get candidates from device index
+        List<Creative> deviceCandidates = creativesByDevice.getOrDefault(device,
+                creativesByDevice.getOrDefault("*", List.of()));
+
+        // Get candidates from segment index
+        List<Creative> segmentCandidates = creativesBySegment.getOrDefault(segment,
+                creativesBySegment.getOrDefault("*", List.of()));
+
+        // Return intersection of all three targeting dimensions
+        Set<String> geoIds = geoCandidates.stream().map(Creative::getId).collect(Collectors.toSet());
+        Set<String> deviceIds = deviceCandidates.stream().map(Creative::getId).collect(Collectors.toSet());
+        Set<String> segmentIds = segmentCandidates.stream().map(Creative::getId).collect(Collectors.toSet());
+
+        geoIds.retainAll(deviceIds);
+        geoIds.retainAll(segmentIds);
+
+        // Return creatives that match all targeting criteria
+        return allCreativesCache.stream()
+                .filter(c -> geoIds.contains(c.getId()))
+                .toList();
     }
 
     private boolean shouldBid() {
@@ -196,33 +342,14 @@ public class BiddingService {
         totalSpentCents.addAndGet((long) (amount * 100));
     }
 
-    private double getPacingHeadroom() {
-        long elapsedSeconds = Duration.between(startTime, Instant.now()).getSeconds() + 1;
-        long durationSeconds = properties.getCompetition().getDurationSeconds();
-        if (durationSeconds <= 0) durationSeconds = 600;
-        double totalBudget = properties.getCreativeBudget() * 200.0;
-        double expectedSpend = (double) elapsedSeconds / durationSeconds * totalBudget;
-        double actualSpend = totalSpentCents.get() / 100.0;
-        return (expectedSpend * 3) - actualSpend;
-    }
-
-    private double getWinRate() {
-        long w = statsCache.getWinCount();
-        long l = statsCache.getLossCount();
-        long total = w + l;
-        return total > 0 ? (double) w / total : 0.0;
-    }
-
-    private double getBurnRate() {
-        long elapsedSeconds = Duration.between(startTime, Instant.now()).getSeconds() + 1;
-        return (totalSpentCents.get() / 100.0) / elapsedSeconds;
-    }
-
     private double computeBidPrice(BidRequest request) {
         double floorPrice = request.floorPrice();
 
-        long winCount = statsCache.getWinCount();
-        long lossCount = statsCache.getLossCount();
+        // Refresh cached stats every 500ms instead of querying Redis on every bid
+        refreshStatsCache();
+
+        long winCount = cachedWinCount;
+        long lossCount = cachedLossCount;
         long totalBids = winCount + lossCount;
 
         // Cold start: bid aggressively to collect data
@@ -241,11 +368,24 @@ public class BiddingService {
             targetBid = floorPrice * 1.10;
         } else {
             // Losing too much: match the market
-            double avgLoss = statsCache.getRollingAverageLossPrice();
+            double avgLoss = cachedAvgLossPrice;
             targetBid = avgLoss > 0 ? avgLoss * 1.02 : floorPrice * 1.15;
         }
 
         return Math.max(targetBid, floorPrice * 1.05);
+    }
+
+    /**
+     * Refresh stats cache every 500ms to avoid Redis reads on every bid.
+     */
+    private void refreshStatsCache() {
+        long now = System.currentTimeMillis();
+        if (now - lastStatsFetch > 500) {
+            lastStatsFetch = now;
+            cachedWinCount = statsCache.getWinCount();
+            cachedLossCount = statsCache.getLossCount();
+            cachedAvgLossPrice = statsCache.getRollingAverageLossPrice();
+        }
     }
 
     /** Total remaining budget across all this bidder's creatives. */
