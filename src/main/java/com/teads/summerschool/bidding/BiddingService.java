@@ -68,6 +68,11 @@ public class BiddingService {
     @PostConstruct
     void registerBudgetGauge() {
         metrics.registerGauge("budget.remaining", this::getRemainingBudgetSafe);
+        metrics.registerGauge("concurrent.bids", () -> concurrentBids.get());
+        metrics.registerGauge("budget.snapshot.age", () -> System.currentTimeMillis() - lastBudgetFetch);
+        metrics.registerGauge("pacing.headroom", this::getPacingHeadroom);
+        metrics.registerGauge("win.rate", this::getWinRate);
+        metrics.registerGauge("budget.burn.rate", this::getBurnRate);
     }
 
     /**
@@ -138,10 +143,11 @@ public class BiddingService {
                         return Mono.just(Optional.<BidResponse>empty());
                     }
 
-                    Creative selectedCreative = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));
+                    Creative selectedCreative = eligibleCreatives.get(random.nextInt(eligibleCreatives.size()));  //this can be done such that from all the creatives the one chosen ends up the one with higheest price
                     double bidPrice = computeBidPrice(request);
 
                     metrics.recordBid();
+                    metrics.recordBidPrice(bidPrice);
                     metrics.recordLatency((int) ((System.nanoTime() - start) / 1_000_000));
 
                     ownBidCache.record(request.requestId(), selectedCreative.getId(), bidPrice);
@@ -188,6 +194,28 @@ public class BiddingService {
 
     public void recordSpend(double amount) {
         totalSpentCents.addAndGet((long) (amount * 100));
+    }
+
+    private double getPacingHeadroom() {
+        long elapsedSeconds = Duration.between(startTime, Instant.now()).getSeconds() + 1;
+        long durationSeconds = properties.getCompetition().getDurationSeconds();
+        if (durationSeconds <= 0) durationSeconds = 600;
+        double totalBudget = properties.getCreativeBudget() * 200.0;
+        double expectedSpend = (double) elapsedSeconds / durationSeconds * totalBudget;
+        double actualSpend = totalSpentCents.get() / 100.0;
+        return (expectedSpend * 3) - actualSpend;
+    }
+
+    private double getWinRate() {
+        long w = statsCache.getWinCount();
+        long l = statsCache.getLossCount();
+        long total = w + l;
+        return total > 0 ? (double) w / total : 0.0;
+    }
+
+    private double getBurnRate() {
+        long elapsedSeconds = Duration.between(startTime, Instant.now()).getSeconds() + 1;
+        return (totalSpentCents.get() / 100.0) / elapsedSeconds;
     }
 
     private double computeBidPrice(BidRequest request) {

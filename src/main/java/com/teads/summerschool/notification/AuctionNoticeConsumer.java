@@ -89,6 +89,7 @@ public class AuctionNoticeConsumer {
 
                 log.debug("KAFKA  Recording win metric");
                 metrics.recordWin(clearingPrice);
+                metrics.recordOverpaid(ourBid.bidPrice() - clearingPrice);
                 biddingService.recordSpend(clearingPrice);
 
                 log.info("** WIN  id={} creative={} clearing={} bid={} overpaid={}",
@@ -97,6 +98,7 @@ public class AuctionNoticeConsumer {
             } else {
                 log.debug("KAFKA  Processing LOSS for id={}", requestId);
                 metrics.recordLoss();
+                metrics.recordLossGap(notice.getClearingPrice() - ourBid.bidPrice());
                 statsCache.recordLoss(notice.getClearingPrice());
 
                 log.debug("** LOSS  id={} bid={} clearing={} gap={}",

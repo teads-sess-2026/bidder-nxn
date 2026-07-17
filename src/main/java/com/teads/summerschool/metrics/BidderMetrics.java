@@ -2,6 +2,7 @@ package com.teads.summerschool.metrics;
 
 import com.teads.summerschool.config.BidderProperties;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -24,6 +25,9 @@ public class BidderMetrics {
     private final Counter losses;
     private final Counter spend;
     private final Timer bidLatency;
+    private final DistributionSummary overpaid;
+    private final DistributionSummary lossGap;
+    private final DistributionSummary bidPrice;
     public final Counter summerschool_bids;
 
     private final String prefix;
@@ -48,6 +52,15 @@ public class BidderMetrics {
         this.bidLatency = Timer.builder(prefix + "bid.latency")
                 .description("Bid handling latency").register(registry);
         this.summerschool_bids = Counter.builder(prefix + "summerschool_bids").description("SummerSchool bids").register(registry);
+        this.overpaid = DistributionSummary.builder(prefix + "overpaid")
+                .description("Amount overpaid per win (bidPrice - clearingPrice)")
+                .register(registry);
+        this.lossGap = DistributionSummary.builder(prefix + "loss.gap")
+                .description("Gap between clearing price and our bid on losses")
+                .register(registry);
+        this.bidPrice = DistributionSummary.builder(prefix + "bid.price")
+                .description("Submitted bid prices")
+                .register(registry);
     }
 
     public void recordRequest() { requests.increment(); }
@@ -66,6 +79,12 @@ public class BidderMetrics {
     }
 
     public void recordLoss() { losses.increment(); }
+
+    public void recordOverpaid(double amount) { overpaid.record(amount); }
+
+    public void recordLossGap(double amount) { lossGap.record(amount); }
+
+    public void recordBidPrice(double price) { bidPrice.record(price); }
 
     /** Register a live gauge (e.g. remaining budget); the group prefix is applied. */
     public void registerGauge(String name, Supplier<Number> supplier) {
