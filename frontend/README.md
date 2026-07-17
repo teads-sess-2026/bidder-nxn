@@ -3,6 +3,7 @@
 A starter dashboard that connects to a bidder's **Stats API** and displays its performance
 (overview KPIs, per-creative breakdown, targeting results, and recent trends). Fork this repo
 and point it at your own bidder to build on top of it.
+Group name: nxn
 
 Set the bidder URL (`backendBaseUrl`) in the environment files — see [Set backend URL](#set-backend-url).
 The API is documented in [`STATS_API.md`](https://github.com/teads-sess-2026/bidder/blob/main/STATS_API.md).
